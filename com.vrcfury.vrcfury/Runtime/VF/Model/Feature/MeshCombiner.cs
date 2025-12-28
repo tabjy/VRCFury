@@ -8,6 +8,7 @@ namespace VF.Model.Feature {
         public bool includeChildren = true;
         public List<MeshSource> meshSources = new List<MeshSource>();
         public bool enableUdimMapping = false;
+        public int udimUvChannel = 0; // UV channel to apply UDIM offset to (0-7, corresponding to uv, uv2, uv3, uv4, uv5, uv6, uv7, uv8)
         
         [Serializable]
         public class MeshSource {

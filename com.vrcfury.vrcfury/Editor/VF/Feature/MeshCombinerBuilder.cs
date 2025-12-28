@@ -201,11 +201,15 @@ namespace VF.Feature {
             List<Vector3> allVertices,
             List<Vector3> allNormals,
             List<Vector4> allTangents,
-            List<Vector2> allUvs,
+            Dictionary<int, List<Vector2>> allUvsByChannel,
             List<Color32> allColors,
             List<BoneWeight> allBoneWeights,
             Dictionary<int, List<int>> trianglesByMaterial,
-            Dictionary<SkinnedMeshRenderer, Dictionary<int, int>> boneIndexMap
+            Dictionary<SkinnedMeshRenderer, Dictionary<int, int>> boneIndexMap,
+            HashSet<int> existingUvChannels,
+            bool hasAnyColors,
+            bool hasAnyNormals,
+            bool hasAnyTangents
         ) {
             var vertexOffset = 0;
             var udimIndex = 0;
@@ -217,10 +221,28 @@ namespace VF.Feature {
                 var mesh = originalMesh;
                 
                 var vertices = mesh.vertices;
-                var normals = mesh.normals.Length > 0 ? mesh.normals : new Vector3[vertices.Length];
-                var tangents = mesh.tangents.Length > 0 ? mesh.tangents : new Vector4[vertices.Length];
-                var uvs = mesh.uv.Length > 0 ? mesh.uv : new Vector2[vertices.Length];
-                var colors = mesh.colors32.Length > 0 ? mesh.colors32 : new Color32[vertices.Length];
+                
+                // Check if this mesh has normals
+                var hasNormals = hasAnyNormals && mesh.normals != null && mesh.normals.Length == mesh.vertexCount;
+                var normals = hasNormals ? mesh.normals : null;
+                
+                // Check if this mesh has tangents
+                var hasTangents = hasAnyTangents && mesh.tangents != null && mesh.tangents.Length == mesh.vertexCount;
+                var tangents = hasTangents ? mesh.tangents : null;
+                
+                // Check if this mesh has vertex colors
+                var hasColors = hasAnyColors && mesh.colors32 != null && mesh.colors32.Length == mesh.vertexCount;
+                var colors = hasColors ? mesh.colors32 : null;
+                
+                // Collect all UV channels (0-7) from this mesh (corresponding to uv, uv2, uv3, uv4, uv5, uv6, uv7, uv8)
+                var uvsByChannel = new Dictionary<int, Vector2[]>();
+                for (int channel = 0; channel <= 7; channel++) {
+                    var channelUvs = new List<Vector2>();
+                    mesh.GetUVs(channel, channelUvs);
+                    if (channelUvs.Count > 0) {
+                        uvsByChannel[channel] = channelUvs.ToArray();
+                    }
+                }
                 
                 // For skinned meshes, vertices are already in the correct space (relative to root bone or renderer)
                 // For non-skinned meshes, we need to transform to target object's local space
@@ -243,32 +265,65 @@ namespace VF.Feature {
                         allVertices.Add(vertexTransform.MultiplyPoint3x4(vertices[i]));
                     }
                     
-                    if (i < normals.Length) {
-                        if (isSkinned) {
-                            allNormals.Add(normals[i]);
+                    // Add normals only if at least one source mesh has normals
+                    if (hasAnyNormals) {
+                        if (hasNormals && normals != null && i < normals.Length) {
+                            if (isSkinned) {
+                                allNormals.Add(normals[i]);
+                            } else {
+                                allNormals.Add(vertexTransform.MultiplyVector(normals[i]).normalized);
+                            }
                         } else {
-                            allNormals.Add(vertexTransform.MultiplyVector(normals[i]).normalized);
+                            // Mesh doesn't have normals, add default up vector
+                            allNormals.Add(Vector3.up);
                         }
-                    } else {
-                        allNormals.Add(Vector3.up);
                     }
                     
-                    if (i < tangents.Length) {
-                        var tangent = tangents[i];
-                        var tangentVec = new Vector3(tangent.x, tangent.y, tangent.z);
-                        if (!isSkinned) {
-                            tangentVec = vertexTransform.MultiplyVector(tangentVec).normalized;
+                    // Add tangents only if at least one source mesh has tangents
+                    if (hasAnyTangents) {
+                        if (hasTangents && tangents != null && i < tangents.Length) {
+                            var tangent = tangents[i];
+                            var tangentVec = new Vector3(tangent.x, tangent.y, tangent.z);
+                            if (!isSkinned) {
+                                tangentVec = vertexTransform.MultiplyVector(tangentVec).normalized;
+                            }
+                            allTangents.Add(new Vector4(tangentVec.x, tangentVec.y, tangentVec.z, tangent.w));
+                        } else {
+                            // Mesh doesn't have tangents, add default tangent
+                            allTangents.Add(new Vector4(1, 0, 0, 1));
                         }
-                        allTangents.Add(new Vector4(tangentVec.x, tangentVec.y, tangentVec.z, tangent.w));
-                    } else {
-                        allTangents.Add(new Vector4(1, 0, 0, 1));
                     }
                     
-                    // Apply UDIM offset to UVs
-                    if (i < uvs.Length) {
-                        allUvs.Add(uvs[i] + udimOffset);
-                    } else {
-                        allUvs.Add(Vector2.zero);
+                    // Add UVs only for channels that exist in at least one source mesh
+                    // Apply UDIM offset only to the selected channel
+                    foreach (var channel in existingUvChannels) {
+                        if (!allUvsByChannel.ContainsKey(channel)) {
+                            allUvsByChannel[channel] = new List<Vector2>();
+                        }
+                        
+                        Vector2 uvValue = Vector2.zero;
+                        if (uvsByChannel.ContainsKey(channel) && i < uvsByChannel[channel].Length) {
+                            uvValue = uvsByChannel[channel][i];
+                        }
+                        
+                        // Apply UDIM offset only to the selected UV channel
+                        if (model.enableUdimMapping && channel == model.udimUvChannel) {
+                            uvValue += udimOffset;
+                        }
+                        
+                        allUvsByChannel[channel].Add(uvValue);
+                    }
+                    
+                    // Add vertex colors only if at least one source mesh has colors
+                    // If this mesh has colors, use them; otherwise use white as default
+                    // This ensures allColors.Count matches allVertices.Count when colors are needed
+                    if (hasAnyColors) {
+                        if (hasColors && colors != null && i < colors.Length) {
+                            allColors.Add(colors[i]);
+                        } else {
+                            // Mesh doesn't have colors or index out of range, add white as default
+                            allColors.Add(new Color32(255, 255, 255, 255));
+                        }
                     }
                 }
                 
@@ -349,7 +404,7 @@ namespace VF.Feature {
             var allVertices = new List<Vector3>();
             var allNormals = new List<Vector3>();
             var allTangents = new List<Vector4>();
-            var allUvs = new List<Vector2>();
+            var allUvsByChannel = new Dictionary<int, List<Vector2>>(); // channel index -> UV list (channels 0-8)
             var trianglesByMaterial = new Dictionary<int, List<int>>(); // material index -> triangles list
             var allColors = new List<Color32>();
             var allBoneWeights = new List<BoneWeight>();
@@ -369,6 +424,42 @@ namespace VF.Feature {
             // Collect blendshape data
             CollectBlendshapeData(meshData, blendshapeData);
             
+            // Detect which UV channels exist in at least one source mesh (0-7, corresponding to uv, uv2, uv3, uv4, uv5, uv6, uv7, uv8)
+            var existingUvChannels = new HashSet<int>();
+            foreach (var (originalMesh, _, _, _, _) in meshData) {
+                for (int channel = 0; channel <= 7; channel++) {
+                    var channelUvs = new List<Vector2>();
+                    originalMesh.GetUVs(channel, channelUvs);
+                    if (channelUvs.Count > 0) {
+                        existingUvChannels.Add(channel);
+                    }
+                }
+            }
+            
+            // If UDIM mapping is enabled, ensure the selected UV channel is included even if it doesn't exist in source meshes
+            // This allows creating a new UV channel just for UDIM mapping
+            if (model.enableUdimMapping && !existingUvChannels.Contains(model.udimUvChannel)) {
+                existingUvChannels.Add(model.udimUvChannel);
+            }
+            
+            // Check if at least one source mesh has vertex colors
+            var hasAnyColors = meshData.Any(md => {
+                var mesh = md.originalMesh;
+                return mesh.colors32 != null && mesh.colors32.Length == mesh.vertexCount;
+            });
+            
+            // Check if at least one source mesh has normals
+            var hasAnyNormals = meshData.Any(md => {
+                var mesh = md.originalMesh;
+                return mesh.normals != null && mesh.normals.Length == mesh.vertexCount;
+            });
+            
+            // Check if at least one source mesh has tangents
+            var hasAnyTangents = meshData.Any(md => {
+                var mesh = md.originalMesh;
+                return mesh.tangents != null && mesh.tangents.Length == mesh.vertexCount;
+            });
+            
             // Combine geometry from all meshes
             CombineGeometry(
                 meshData,
@@ -377,18 +468,36 @@ namespace VF.Feature {
                 allVertices,
                 allNormals,
                 allTangents,
-                allUvs,
+                allUvsByChannel,
                 allColors,
                 allBoneWeights,
                 trianglesByMaterial,
-                boneIndexMap
+                boneIndexMap,
+                existingUvChannels,
+                hasAnyColors,
+                hasAnyNormals,
+                hasAnyTangents
             );
             
             // Build combined mesh manually with multiple submeshes
             combinedMesh.vertices = allVertices.ToArray();
-            combinedMesh.normals = allNormals.ToArray();
-            combinedMesh.tangents = allTangents.ToArray();
-            combinedMesh.uv = allUvs.ToArray();
+            
+            // Only set normals if at least one source mesh had them
+            if (hasAnyNormals && allNormals.Count == allVertices.Count) {
+                combinedMesh.normals = allNormals.ToArray();
+            }
+            
+            // Only set tangents if at least one source mesh had them
+            if (hasAnyTangents && allTangents.Count == allVertices.Count) {
+                combinedMesh.tangents = allTangents.ToArray();
+            }
+            
+            // Set all UV channels that have data (0-7, corresponding to uv, uv2, uv3, uv4, uv5, uv6, uv7, uv8)
+            for (int channel = 0; channel <= 7; channel++) {
+                if (allUvsByChannel.ContainsKey(channel) && allUvsByChannel[channel].Count == allVertices.Count) {
+                    combinedMesh.SetUVs(channel, allUvsByChannel[channel]);
+                }
+            }
             
             // Set up submeshes (one per unique material)
             combinedMesh.subMeshCount = uniqueMaterials.Count;
@@ -401,13 +510,9 @@ namespace VF.Feature {
                 }
             }
             
-            // Only set vertex colors if ALL source meshes had them (don't add colors if any mesh was missing them)
-            // This prevents accidentally adding white colors which can darken the appearance
-            var allMeshesHadColors = meshData.All(md => {
-                var mesh = md.originalMesh;
-                return mesh.colors32 != null && mesh.colors32.Length == mesh.vertexCount;
-            });
-            if (allMeshesHadColors && allColors.Count == allVertices.Count) {
+            // Only set vertex colors if at least one source mesh had them
+            // This ensures we only add color channel when it actually exists in source data
+            if (hasAnyColors && allColors.Count == allVertices.Count) {
                 combinedMesh.colors32 = allColors.ToArray();
             }
             
@@ -417,8 +522,16 @@ namespace VF.Feature {
             
             // Recalculate normals and tangents after combining to ensure proper lighting
             // This is especially important when combining meshes from different transforms
-            combinedMesh.RecalculateNormals();
-            combinedMesh.RecalculateTangents();
+            // Only recalculate normals if at least one source mesh had them
+            if (hasAnyNormals) {
+                combinedMesh.RecalculateNormals();
+            }
+            
+            // Only recalculate tangents if at least one source mesh had them
+            if (hasAnyTangents) {
+                combinedMesh.RecalculateTangents();
+            }
+            
             combinedMesh.RecalculateBounds();
             combinedMesh.ForceReadable();
             
@@ -630,6 +743,7 @@ namespace VF.Feature {
             var includeChildrenProp = prop.FindPropertyRelative("includeChildren");
             var meshSourcesProp = prop.FindPropertyRelative("meshSources");
             var enableUdimMappingProp = prop.FindPropertyRelative("enableUdimMapping");
+            var udimUvChannelProp = prop.FindPropertyRelative("udimUvChannel");
             
             content.Add(VRCFuryEditorUtils.Prop(includeChildrenProp, "Include all children", 
                 tooltip: "If enabled, combines all renderers in children. If disabled, only combines explicitly specified meshes."));
@@ -701,6 +815,27 @@ namespace VF.Feature {
             content.Add(VRCFuryEditorUtils.RefreshOnChange(() => {
                 var c = new VisualElement();
                 if (enableUdimMappingProp.boolValue) {
+                    // UV channel dropdown (0-7, corresponding to uv, uv2, uv3, uv4, uv5, uv6, uv7, uv8)
+                    var channelChoices = Enumerable.Range(0, 8).ToList();
+                    var selectedChannel = Mathf.Clamp(udimUvChannelProp.intValue, 0, 7);
+                    if (!channelChoices.Contains(selectedChannel)) {
+                        channelChoices.Add(selectedChannel);
+                    }
+                    var selectedIndex = channelChoices.IndexOf(selectedChannel);
+                    
+                    string FormatLabel(int channel) {
+                        return $"UV{channel}";
+                    }
+                    
+                    var channelField = new PopupField<int>(channelChoices, selectedIndex, FormatLabel, FormatLabel);
+                    channelField.label = "UDIM UV Channel";
+                    channelField.tooltip = "Select which UV channel to apply UDIM offset to. All UV channels will be preserved, but only the selected channel will have UDIM offset applied.";
+                    channelField.RegisterValueChangedCallback(cb => {
+                        udimUvChannelProp.intValue = cb.newValue;
+                        udimUvChannelProp.serializedObject.ApplyModifiedProperties();
+                    });
+                    c.Add(channelField);
+                    
                     if (includeChildrenProp.boolValue) {
                         c.Add(VRCFuryEditorUtils.WrappedLabel("UDIM tiles are assigned automatically. Change orders by rearranging children in the hierarchy."));
                     } else {
@@ -708,7 +843,7 @@ namespace VF.Feature {
                     }
                 }
                 return c;
-            }, enableUdimMappingProp, includeChildrenProp));
+            }, enableUdimMappingProp, includeChildrenProp, udimUvChannelProp));
             
             // Show preview of what will be combined
             content.Add(VRCFuryEditorUtils.Debug(refreshElement: () => {
