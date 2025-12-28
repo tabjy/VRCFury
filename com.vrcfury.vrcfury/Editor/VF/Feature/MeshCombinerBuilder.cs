@@ -7,6 +7,7 @@ using UnityEngine;
 using UnityEngine.UIElements;
 using VF.Builder;
 using VF.Feature.Base;
+using VF.Hooks;
 using VF.Injector;
 using VF.Inspector;
 using VF.Model.Feature;
@@ -22,40 +23,65 @@ namespace VF.Feature {
         [FeatureBuilderAction(FeatureOrder.Default)]
         public void Apply() {
             var componentObject = featureBaseObject;
+            
+            var validRenderers = CollectAndFilterRenderers(componentObject, model);
+            if (validRenderers.Count == 0) {
+                Debug.Log($"MeshCombiner: No valid renderer found on {componentObject.GetPath(avatarObject)}");
+                return;
+            } else if (validRenderers.Count == 1) {
+                Debug.Log($"MeshCombiner: Only one valid renderer found, skipping combine on {componentObject.GetPath(avatarObject)}");
+                return;
+            }
+            
+            CombineMeshes(componentObject, validRenderers);
+        }
+
+        private static List<Renderer> CollectAndFilterRenderers(VFGameObject componentObject, MeshCombiner model) {
+            var renderers = CollectRenderers(componentObject, model);
+            if (renderers.Count == 0) {
+                return new List<Renderer>();
+            }
+            
+            var validRenderers = FilterValidRenderers(renderers);
+            if (validRenderers.Count == 0) {
+                return new List<Renderer>();
+            }
+
+            return validRenderers;
+
+        }
+        
+        private static List<Renderer> CollectRenderers(VFGameObject componentObject, MeshCombiner model) {
             var renderers = new List<Renderer>();
             
-            if (model.meshSources.Count > 0) {
-                // Use explicitly specified mesh sources
+            if (model.includeChildren) {
+                // Collect all renderers from children
+                renderers.AddRange(componentObject.GetComponentsInSelfAndChildren<Renderer>());
+
+                // Or, only direct children
+                // foreach (var child in componentObject.Children()) {
+                //     var renderer = child.GetComponent<Renderer>();
+                //     if (renderer != null) {
+                //         renderers.Add(renderer);
+                //     }
+                // }
+            } else if (model.meshSources.Count > 0) {
                 foreach (var source in model.meshSources) {
                     if (source.obj == null) continue;
-                    var obj = source.obj;
-                    var renderer = obj.GetComponent<Renderer>();
+                    var renderer = source.obj.GetComponent<Renderer>();
                     if (renderer == null) {
-                        Debug.LogWarning($"MeshCombiner: Object {obj.name} does not have a Renderer component");
+                        Debug.LogWarning($"MeshCombiner: Object {source.obj.name} does not have a Renderer component");
                         continue;
                     }
                     renderers.Add(renderer);
                 }
-            } else if (model.includeChildren) {
-                // Collect all renderers from children
-                renderers.AddRange(componentObject.GetComponentsInSelfAndChildren<Renderer>());
-            } else {
-                // Only direct children
-                foreach (var child in componentObject.Children()) {
-                    var renderer = child.GetComponent<Renderer>();
-                    if (renderer != null) {
-                        renderers.Add(renderer);
-                    }
-                }
             }
             
-            if (renderers.Count == 0) {
-                Debug.LogWarning($"MeshCombiner: No renderers found on {componentObject.GetPath(avatarObject)}");
-                return;
-            }
-            
-            // Filter to only MeshRenderers and SkinnedMeshRenderers with valid meshes
-            var validRenderers = renderers
+            return renderers;
+        }
+        
+        private static List<Renderer> FilterValidRenderers(List<Renderer> renderers) {
+            return renderers
                 .Where(r => {
                     if (r is SkinnedMeshRenderer skin) {
                         return skin.sharedMesh != null;
@@ -67,59 +93,35 @@ namespace VF.Feature {
                     return false;
                 })
                 .ToList();
-            
-            if (validRenderers.Count == 0) {
-                Debug.LogWarning($"MeshCombiner: No valid meshes found on {componentObject.GetPath(avatarObject)}");
-                return;
-            }
-            
-            if (validRenderers.Count == 1) {
-                Debug.Log($"MeshCombiner: Only one renderer found, skipping combine on {componentObject.GetPath(avatarObject)}");
-                return;
-            }
-            
-            // Combine meshes
-            CombineMeshes(componentObject, validRenderers);
         }
         
-        private void CombineMeshes(VFGameObject targetObject, List<Renderer> renderers) {
-            var combinedMesh = new Mesh();
-            combinedMesh.name = $"Combined_{targetObject.name}";
-            
-            // Collect all unique materials from all renderers
-            var materialToIndex = new Dictionary<Material, int>(); // material -> index in combined materials array
-            var uniqueMaterials = new List<Material>();
-            
-            var blendshapeData = new Dictionary<string, List<(int vertexOffset, int vertexCount, Mesh sourceMesh, int blendshapeIndex, Matrix4x4 transform)>>();
-            
-            // Collect all vertex data manually to combine into multiple submeshes (one per unique material)
-            var allVertices = new List<Vector3>();
-            var allNormals = new List<Vector3>();
-            var allTangents = new List<Vector4>();
-            var allUvs = new List<Vector2>();
-            var trianglesByMaterial = new Dictionary<int, List<int>>(); // material index -> triangles list
-            var allColors = new List<Color32>();
-            var allBoneWeights = new List<BoneWeight>();
-            var allBones = new List<Transform>();
-            var allBindPoses = new List<Matrix4x4>();
-            var boneIndexMap = new Dictionary<SkinnedMeshRenderer, Dictionary<int, int>>(); // Maps each skin's bone index to combined bone index
+        private static Vector2 CalculateUdimOffset(int index) {
+            // UDIM tiles are arranged in a 4x4 grid (Poiyomi style)
+            // Bottom left is (0,0), top right is (3,3)
+            // Tile index maps to (u, v) where u = column, v = row
+            var u = index % 4; // Column (0-3)
+            var v = index / 4; // Row (0-3)
+            return new Vector2(u, v);
+        }
+        
+        private void CollectBones(
+            List<Renderer> renderers,
+            List<Transform> allBones,
+            List<Matrix4x4> allBindPoses,
+            Dictionary<SkinnedMeshRenderer, Dictionary<int, int>> boneIndexMap
+        ) {
+            var boneToIndex = new Dictionary<Transform, int>(); // bone -> index in combined bones array
             
             // First pass: collect all unique bones from all meshes
-            var boneToIndex = new Dictionary<Transform, int>(); // bone -> index in combined bones array
-            var boneToBindPose = new Dictionary<Transform, Matrix4x4>(); // bone -> bindpose
-            
             foreach (var renderer in renderers) {
                 if (renderer is SkinnedMeshRenderer skin && skin.bones != null && skin.sharedMesh != null) {
                     var mesh = skin.sharedMesh;
                     for (int i = 0; i < skin.bones.Length && i < mesh.bindposes.Length; i++) {
                         var bone = skin.bones[i];
-                        if (bone != null) {
-                            if (!boneToIndex.ContainsKey(bone)) {
-                                boneToIndex[bone] = allBones.Count;
-                                allBones.Add(bone);
-                                allBindPoses.Add(mesh.bindposes[i]);
-                                boneToBindPose[bone] = mesh.bindposes[i];
-                            }
+                        if (bone != null && !boneToIndex.ContainsKey(bone)) {
+                            boneToIndex[bone] = allBones.Count;
+                            allBones.Add(bone);
+                            allBindPoses.Add(mesh.bindposes[i]);
                         }
                     }
                 }
@@ -138,8 +140,13 @@ namespace VF.Feature {
                     boneIndexMap[skin] = indexMap;
                 }
             }
-            
-            // Third pass: collect all unique materials from all renderers
+        }
+        
+        private void CollectMaterials(
+            List<Renderer> renderers,
+            Dictionary<Material, int> materialToIndex,
+            List<Material> uniqueMaterials
+        ) {
             foreach (var renderer in renderers) {
                 if (renderer.sharedMaterials != null) {
                     foreach (var material in renderer.sharedMaterials) {
@@ -150,8 +157,9 @@ namespace VF.Feature {
                     }
                 }
             }
-            
-            // Fourth pass: collect mesh data - for skinned meshes, keep vertices in original space
+        }
+        
+        private List<(Mesh originalMesh, int vertexCount, Renderer renderer, bool isSkinned, SkinnedMeshRenderer skin)> CollectMeshData(List<Renderer> renderers) {
             var meshData = new List<(Mesh originalMesh, int vertexCount, Renderer renderer, bool isSkinned, SkinnedMeshRenderer skin)>();
             
             foreach (var renderer in renderers) {
@@ -164,7 +172,13 @@ namespace VF.Feature {
                 meshData.Add((mesh, mesh.vertexCount, renderer, isSkinned, skinRef));
             }
             
-            // Fifth pass: collect blendshape data from original meshes
+            return meshData;
+        }
+        
+        private void CollectBlendshapeData(
+            List<(Mesh originalMesh, int vertexCount, Renderer renderer, bool isSkinned, SkinnedMeshRenderer skin)> meshData,
+            Dictionary<string, List<(int vertexOffset, int vertexCount, Mesh sourceMesh, int blendshapeIndex, Matrix4x4 transform)>> blendshapeData
+        ) {
             var vertexOffset = 0;
             foreach (var (originalMesh, vertexCount, renderer, isSkinned, skin) in meshData) {
                 // For blendshapes, we don't need to transform (they're deltas)
@@ -178,31 +192,26 @@ namespace VF.Feature {
                 }
                 vertexOffset += vertexCount;
             }
-            
-            // Sixth pass: manually combine all mesh data into multiple submeshes (one per unique material)
-            vertexOffset = 0;
+        }
+        
+        private void CombineGeometry(
+            List<(Mesh originalMesh, int vertexCount, Renderer renderer, bool isSkinned, SkinnedMeshRenderer skin)> meshData,
+            VFGameObject targetObject,
+            Dictionary<Material, int> materialToIndex,
+            List<Vector3> allVertices,
+            List<Vector3> allNormals,
+            List<Vector4> allTangents,
+            List<Vector2> allUvs,
+            List<Color32> allColors,
+            List<BoneWeight> allBoneWeights,
+            Dictionary<int, List<int>> trianglesByMaterial,
+            Dictionary<SkinnedMeshRenderer, Dictionary<int, int>> boneIndexMap
+        ) {
+            var vertexOffset = 0;
+            var udimIndex = 0;
             foreach (var (originalMesh, vertexCount, renderer, isSkinned, skin) in meshData) {
                 // Get UDIM offset for this mesh
-                // When explicitly specifying meshes, UDIM tile is calculated from order in the list
-                var udimOffset = Vector2.zero;
-                if (model.enableUdimMapping) {
-                    if (model.meshSources.Count > 0) {
-                        // Explicitly specified meshes: use index in list as UDIM tile
-                        var sourceIndex = model.meshSources.FindIndex(s => s.obj == renderer.owner());
-                        if (sourceIndex >= 0) {
-                            // UDIM tiles are arranged in a 10x1 grid (0-9)
-                            // Each tile is 1 unit wide, so tile N starts at X = N
-                            udimOffset = new Vector2(sourceIndex, 0);
-                        }
-                    } else {
-                        // Include children mode: use udimTile from meshSources if available
-                        // (This shouldn't happen in include children mode, but keep for compatibility)
-                        var source = model.meshSources.FirstOrDefault(s => s.obj == renderer.owner());
-                        if (source != null) {
-                            udimOffset = new Vector2(source.udimTile, 0);
-                        }
-                    }
-                }
+                var udimOffset = model.enableUdimMapping ? CalculateUdimOffset(udimIndex++) : Vector2.zero;
                 
                 // Get mesh data (GetMesh already handles making it readable if needed)
                 var mesh = originalMesh;
@@ -260,12 +269,6 @@ namespace VF.Feature {
                         allUvs.Add(uvs[i] + udimOffset);
                     } else {
                         allUvs.Add(Vector2.zero);
-                    }
-                    
-                    // Only add vertex colors if they exist in the source mesh
-                    // Don't add white colors if they don't exist, as this can affect lighting
-                    if (i < colors.Length) {
-                        allColors.Add(colors[i]);
                     }
                 }
                 
@@ -329,6 +332,57 @@ namespace VF.Feature {
                 
                 vertexOffset += vertexCount;
             }
+        }
+        
+        private void CombineMeshes(VFGameObject targetObject, List<Renderer> renderers) {
+            var combinedMesh = new Mesh();
+            combinedMesh.name = $"Combined_{targetObject.name}";
+            
+            // Collect all unique materials from all renderers
+            var materialToIndex = new Dictionary<Material, int>(); // material -> index in combined materials array
+            var uniqueMaterials = new List<Material>();
+            
+            // Collect all blendshape data for merging
+            var blendshapeData = new Dictionary<string, List<(int vertexOffset, int vertexCount, Mesh sourceMesh, int blendshapeIndex, Matrix4x4 transform)>>();
+            
+            // Collect all vertex data manually to combine into multiple submeshes (one per unique material)
+            var allVertices = new List<Vector3>();
+            var allNormals = new List<Vector3>();
+            var allTangents = new List<Vector4>();
+            var allUvs = new List<Vector2>();
+            var trianglesByMaterial = new Dictionary<int, List<int>>(); // material index -> triangles list
+            var allColors = new List<Color32>();
+            var allBoneWeights = new List<BoneWeight>();
+            var allBones = new List<Transform>();
+            var allBindPoses = new List<Matrix4x4>();
+            var boneIndexMap = new Dictionary<SkinnedMeshRenderer, Dictionary<int, int>>(); // Maps each skin's bone index to combined bone index
+            
+            // Collect bones and create index mapping
+            CollectBones(renderers, allBones, allBindPoses, boneIndexMap);
+            
+            // Collect unique materials
+            CollectMaterials(renderers, materialToIndex, uniqueMaterials);
+            
+            // Collect mesh data
+            var meshData = CollectMeshData(renderers);
+            
+            // Collect blendshape data
+            CollectBlendshapeData(meshData, blendshapeData);
+            
+            // Combine geometry from all meshes
+            CombineGeometry(
+                meshData,
+                targetObject,
+                materialToIndex,
+                allVertices,
+                allNormals,
+                allTangents,
+                allUvs,
+                allColors,
+                allBoneWeights,
+                trianglesByMaterial,
+                boneIndexMap
+            );
             
             // Build combined mesh manually with multiple submeshes
             combinedMesh.vertices = allVertices.ToArray();
@@ -541,13 +595,25 @@ namespace VF.Feature {
                 );
             }
             
-            // Hide source renderers (non-destructive - they'll be removed by EditorOnly system)
+            // Disable source renderers (and remove them if actually uploading)
+            var isActuallyUploadingHook = IsActuallyUploadingHook.Get();
             foreach (var renderer in renderers) {
                 if (renderer != targetRenderer) {
                     renderer.enabled = false;
-                    // Optionally mark objects for deletion during upload
-                    var owner = renderer.owner();
-                    // User can manually add DeleteDuringUpload if they want to remove these
+
+                    if (isActuallyUploadingHook) {
+                        // Remove the renderer component
+                        UnityEngine.Object.DestroyImmediate(renderer);
+
+                        // For MeshRenderer, also remove the MeshFilter if present
+                        if (renderer is MeshRenderer meshRenderer) {
+                            var meshFilter = renderer.owner().GetComponent<MeshFilter>();
+                            if (meshFilter != null) {
+                                UnityEngine.Object.DestroyImmediate(meshFilter);
+                            }
+                            UnityEngine.Object.DestroyImmediate(meshRenderer);
+                        }    
+                    }
                 }
             }
             
@@ -565,19 +631,15 @@ namespace VF.Feature {
             var meshSourcesProp = prop.FindPropertyRelative("meshSources");
             var enableUdimMappingProp = prop.FindPropertyRelative("enableUdimMapping");
             
-            content.Add(VRCFuryEditorUtils.Prop(includeChildrenProp, "Include Children", 
+            content.Add(VRCFuryEditorUtils.Prop(includeChildrenProp, "Include all children", 
                 tooltip: "If enabled, combines all renderers in children. If disabled, only combines explicitly specified meshes."));
             
             content.Add(VRCFuryEditorUtils.RefreshOnChange(() => {
                 var c = new VisualElement();
                 if (!includeChildrenProp.boolValue) {
                     c.Add(VRCFuryEditorUtils.WrappedLabel("Specify meshes to combine:"));
-                    var udimLabel = VRCFuryEditorUtils.WrappedLabel("UDIM tiles will be assigned automatically based on order (first = 0, second = 1, etc.)");
-                    udimLabel.style.fontSize = 11;
-                    c.Add(udimLabel);
                     
                     // Custom list that hides udimTile field - only show obj field
-#if UNITY_2022_1_OR_NEWER
                     var listContainer = new VisualElement();
                     listContainer.AddToClassList("vfList");
                     
@@ -629,36 +691,20 @@ namespace VF.Feature {
                     listContainer.Add(listView);
                     listContainer.Add(footer);
                     c.Add(listContainer);
-#else
-                    // Fallback for older Unity versions - use standard list but hide udimTile via CSS
-                    var listEl = VRCFuryEditorUtils.Prop(meshSourcesProp, "Mesh Sources");
-                    // Hide udimTile fields using style
-                    listEl.schedule.Execute(() => {
-                        var udimFields = listEl.Query<PropertyField>().ToList();
-                        foreach (var field in udimFields) {
-                            var prop = field.bindingPath;
-                            if (prop != null && prop.Contains("udimTile")) {
-                                field.style.display = DisplayStyle.None;
-                            }
-                        }
-                    });
-                    c.Add(listEl);
-#endif
                 }
                 return c;
             }, includeChildrenProp));
             
-            content.Add(VRCFuryEditorUtils.Prop(enableUdimMappingProp, "Enable UDIM Mapping", 
+            content.Add(VRCFuryEditorUtils.Prop(enableUdimMappingProp, "Enable UDIM mapping", 
                 tooltip: "If enabled, applies UDIM UV offsets to each mesh. When explicitly specifying meshes, UDIM tiles are assigned automatically based on order."));
             
             content.Add(VRCFuryEditorUtils.RefreshOnChange(() => {
                 var c = new VisualElement();
                 if (enableUdimMappingProp.boolValue) {
-                    if (!includeChildrenProp.boolValue) {
-                        c.Add(VRCFuryEditorUtils.WrappedLabel("UDIM tiles are assigned automatically: first mesh = tile 0 (UDIM 1001), second = tile 1 (UDIM 1002), etc."));
+                    if (includeChildrenProp.boolValue) {
+                        c.Add(VRCFuryEditorUtils.WrappedLabel("UDIM tiles are assigned automatically. Change orders by rearranging children in the hierarchy."));
                     } else {
-                        c.Add(VRCFuryEditorUtils.WrappedLabel("UDIM tiles: 0 = UDIM 1001, 1 = UDIM 1002, etc."));
-                        c.Add(VRCFuryEditorUtils.WrappedLabel("Each mesh will have its UV coordinates offset by the tile index."));
+                        c.Add(VRCFuryEditorUtils.WrappedLabel("UDIM tiles are assigned automatically. Change orders by updating the order of meshes in the list."));
                     }
                 }
                 return c;
@@ -667,83 +713,49 @@ namespace VF.Feature {
             // Show preview of what will be combined
             content.Add(VRCFuryEditorUtils.Debug(refreshElement: () => {
                 var preview = new VisualElement();
-                preview.Add(VRCFuryEditorUtils.WrappedLabel("Will combine:").Bold());
-                
-                var renderers = new List<Renderer>();
-                if (model.meshSources.Count > 0) {
-                    foreach (var source in model.meshSources) {
-                        if (source.obj != null) {
-                            var renderer = source.obj.GetComponent<Renderer>();
-                            if (renderer != null) {
-                                renderers.Add(renderer);
-                            }
-                        }
-                    }
-                } else if (model.includeChildren) {
-                    renderers.AddRange(componentObject.GetComponentsInSelfAndChildren<Renderer>());
-                } else {
-                    foreach (var child in componentObject.Children()) {
-                        var renderer = child.GetComponent<Renderer>();
-                        if (renderer != null) {
-                            renderers.Add(renderer);
-                        }
-                    }
-                }
-                
-                var validRenderers = renderers
-                    .Where(r => {
-                        if (r is SkinnedMeshRenderer skin) return skin.sharedMesh != null;
-                        if (r is MeshRenderer) {
-                            var filter = r.owner().GetComponent<MeshFilter>();
-                            return filter != null && filter.sharedMesh != null;
-                        }
-                        return false;
-                    })
-                    .ToList();
-                
+                preview.Add(VRCFuryEditorUtils.WrappedLabel(""));
+            
+                var validRenderers = CollectAndFilterRenderers(componentObject, model);
                 if (validRenderers.Count == 0) {
                     preview.Add(VRCFuryEditorUtils.Warn("No valid renderers found to combine."));
-                } else {
-                    foreach (var renderer in validRenderers) {
-                        var mesh = renderer.GetMesh();
-                        var meshName = mesh != null ? mesh.name : "No mesh";
-                        var vertexCount = mesh != null ? mesh.vertexCount : 0;
-                        
-                        // Get path - try relative to componentObject first, fallback to full path if not a child
-                        string path;
-                        try {
-                            var rendererObj = renderer.owner();
-                            if (rendererObj.IsChildOf(componentObject)) {
-                                path = rendererObj.GetPath(componentObject);
-                            } else {
-                                // Not a child, use full path from avatar root or just the object name
-                                path = rendererObj.GetPath(avatarObject);
-                            }
-                        } catch {
-                            // Fallback to just the object name if path calculation fails
-                            path = renderer.owner().name;
+                    return preview;
+                } else if (validRenderers.Count == 1) {
+                    preview.Add(VRCFuryEditorUtils.Warn("Only one valid renderers found. No action will be taken."));
+                    return preview;
+                }
+                
+                preview.Add(VRCFuryEditorUtils.WrappedLabel("Will combine:").Bold());
+
+                var udimIndex = 0;
+                foreach (var renderer in validRenderers) {    
+                    var mesh = renderer.GetMesh();
+                    var meshName = mesh != null ? mesh.name : "No mesh";
+                    var vertexCount = mesh != null ? mesh.vertexCount : 0;
+                    
+                    // Get path - try relative to componentObject first, fallback to full path if not a child
+                    string path;
+                    try {
+                        var rendererObj = renderer.owner();
+                        if (rendererObj.IsChildOf(componentObject)) {
+                            path = rendererObj.GetPath(componentObject);
+                        } else {
+                            // Not a child, use full path from avatar root or just the object name
+                            path = rendererObj.GetPath(avatarObject);
                         }
-                        
-                        var udimInfo = "";
-                        if (model.enableUdimMapping) {
-                            if (model.meshSources.Count > 0) {
-                                // Explicitly specified meshes: show calculated UDIM tile from order
-                                var sourceIndex = model.meshSources.FindIndex(s => s.obj == renderer.owner());
-                                if (sourceIndex >= 0) {
-                                    udimInfo = $" (UDIM tile {sourceIndex})";
-                                }
-                            } else {
-                                // Include children mode: show udimTile from source if available
-                                var source = model.meshSources.FirstOrDefault(s => s.obj == renderer.owner());
-                                if (source != null) {
-                                    udimInfo = $" (UDIM tile {source.udimTile})";
-                                }
-                            }
-                        }
-                        
-                        preview.Add(VRCFuryEditorUtils.WrappedLabel($"  • {path}: {meshName} ({vertexCount} vertices){udimInfo}"));
+                    } catch {
+                        // Fallback to just the object name if path calculation fails
+                        path = renderer.owner().name;
+                    }
+
+                    preview.Add(VRCFuryEditorUtils.WrappedLabel($"  • {path}"));
+                    preview.Add(VRCFuryEditorUtils.WrappedLabel($"    \tMesh: {meshName} ({vertexCount} vertices)"));
+                    
+                    if (model.enableUdimMapping) {
+                        var udimOffset = CalculateUdimOffset(udimIndex++);
+                        preview.Add(VRCFuryEditorUtils.WrappedLabel($"    \tUDIM tile: (u={udimOffset.x}, v={udimOffset.y})"));
                     }
                 }
+                
                 
                 return preview;
             }));
